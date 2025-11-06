@@ -1,15 +1,13 @@
 // index.js
-// WhatsApp Business Platform (Cloud API) — Webhook con logging a archivo + derivación
-// Autor: Antonio (toto) @ NIMAT
-
+// WhatsApp Business Platform — Webhook con log (JSONL) y sync a Google Drive sin disk de Render
 import express from "express";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
+import { google } from "googleapis";
 
-// En Node 18+ fetch es global.
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -20,42 +18,109 @@ app.use(express.json({ verify: rawBodySaver }));
 
 // ====== CONFIG ======
 const PORT = process.env.PORT || 3000;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN; // token de verificación (Meta)
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN; // token de acceso de Cloud API
-const WABA_PHONE_ID = process.env.WABA_PHONE_ID; // ej: 123456789012345
-const APP_SECRET = process.env.APP_SECRET || null; // opcional: para verificar X-Hub-Signature-256
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const WABA_PHONE_ID = process.env.WABA_PHONE_ID;
+const APP_SECRET = process.env.APP_SECRET || null;
 
 // Derivación a Ventas
 const VENTAS_NUMBER_E164 = process.env.VENTAS_NUMBER_E164 || "+54911XXXXXXX";
 const VENTAS_NUMBER_PLAIN = VENTAS_NUMBER_E164.replace(/\+/g, "");
 
-// Archivo de logs (JSON Lines)
-const LOG_FILE_PATH =
-  process.env.LOG_FILE_PATH || path.join(__dirname, "data", "waba-events.jsonl");
+// Log local (efímero) + Sync a Drive
+const LOG_LOCAL_DIR = process.env.LOG_LOCAL_DIR || "/tmp/nimat-logs";
+const DRIVE_SYNC_ENABLED = String(process.env.DRIVE_SYNC_ENABLED || "true") === "true";
+const DRIVE_SYNC_INTERVAL_MS = Number(process.env.DRIVE_SYNC_INTERVAL_MS || 15000);
+const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
-// Asegurar carpeta
-fs.mkdirSync(path.dirname(LOG_FILE_PATH), { recursive: true });
-
-// ====== UTILES ======
-function rawBodySaver(req, res, buf) {
-  req.rawBody = buf;
+// ====== GOOGLE DRIVE CLIENT ======
+let drive = null;
+async function initDrive() {
+  if (!DRIVE_SYNC_ENABLED) return;
+  const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
+  let privateKey = process.env.GOOGLE_PRIVATE_KEY;
+  if (!clientEmail || !privateKey || !GOOGLE_DRIVE_FOLDER_ID) {
+    console.warn("Drive sync deshabilitado: faltan creds o folder id");
+    return;
+  }
+  privateKey = privateKey.replace(/\\n/g, "\n");
+  const auth = new google.auth.JWT(clientEmail, null, privateKey, [
+    "https://www.googleapis.com/auth/drive.file"
+  ]);
+  drive = google.drive({ version: "v3", auth });
 }
 
-function log(...args) {
-  console.log(new Date().toISOString(), "—", ...args);
+function rawBodySaver(req, res, buf) { req.rawBody = buf; }
+function log(...args) { console.log(new Date().toISOString(), "—", ...args); }
+
+fs.mkdirSync(LOG_LOCAL_DIR, { recursive: true });
+
+// ====== UTIL FECHAS/FILES ======
+const pad = (n) => String(n).padStart(2, "0");
+const todayKey = () => {
+  const d = new Date();
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}`;
+};
+const localPathFor = (key) => path.join(LOG_LOCAL_DIR, `waba-events-${key}.jsonl`);
+
+async function md5File(filePath) {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash("md5");
+    const s = fs.createReadStream(filePath);
+    s.on("data", (d) => h.update(d));
+    s.on("end", () => resolve(h.digest("hex")));
+    s.on("error", reject);
+  });
 }
 
-// Cola de escritura para evitar condiciones de carrera al escribir el archivo
+async function driveFindFileIdByName(name) {
+  if (!drive) return null;
+  const q = `'${GOOGLE_DRIVE_FOLDER_ID}' in parents and name='${name}' and trashed=false`;
+  const { data } = await drive.files.list({ q, fields: "files(id,name)", spaces: "drive" });
+  return data.files?.[0]?.id || null;
+}
+
+async function driveDownloadToLocal(fileId, destPath) {
+  const dest = fs.createWriteStream(destPath);
+  const resp = await drive.files.get({ fileId, alt: "media" }, { responseType: "stream" });
+  await new Promise((resolve, reject) => {
+    resp.data.pipe(dest).on("finish", resolve).on("error", reject);
+  });
+}
+
+async function driveCreateOrUpdate(name, localPath, fileId = null) {
+  const media = { mimeType: "application/json", body: fs.createReadStream(localPath) };
+  if (fileId) {
+    await drive.files.update({ fileId, media });
+    return fileId;
+  }
+  const requestBody = { name, parents: [GOOGLE_DRIVE_FOLDER_ID], mimeType: "application/json" };
+  const { data } = await drive.files.create({ requestBody, media, fields: "id" });
+  return data.id;
+}
+
+// ====== SEED AL INICIAR (traer archivo de HOY si existe en Drive) ======
+async function seedTodayFromDrive() {
+  if (!drive) return;
+  const key = todayKey();
+  const name = `waba-events-${key}.jsonl`;
+  const local = localPathFor(key);
+  if (fs.existsSync(local)) return; // ya existe
+  const fid = await driveFindFileIdByName(name);
+  if (fid) {
+    fs.mkdirSync(path.dirname(local), { recursive: true });
+    await driveDownloadToLocal(fid, local);
+    log("Seed desde Drive OK:", name);
+  }
+}
+
+// ====== QUEUE DE LOG (escritura local en /tmp) ======
 const writeQueue = [];
 let writing = false;
 
 function diskLog(kind, payload = {}) {
-  const line = JSON.stringify({
-    ts: new Date().toISOString(),
-    kind, // 'status' | 'message' | 'action' | 'error'
-    ...payload,
-  });
-  writeQueue.push(line + "\n");
+  const line = JSON.stringify({ ts: new Date().toISOString(), kind, ...payload }) + "\n";
+  writeQueue.push({ key: todayKey(), line });
   flushQueue();
 }
 
@@ -63,8 +128,18 @@ async function flushQueue() {
   if (writing || writeQueue.length === 0) return;
   writing = true;
   try {
-    const chunk = writeQueue.splice(0, writeQueue.length).join("");
-    await fs.promises.appendFile(LOG_FILE_PATH, chunk, "utf8");
+    // Agrupar por key (día)
+    const groups = new Map();
+    for (const item of writeQueue.splice(0, writeQueue.length)) {
+      const arr = groups.get(item.key) || [];
+      arr.push(item.line);
+      groups.set(item.key, arr);
+    }
+    for (const [key, lines] of groups.entries()) {
+      const fpath = localPathFor(key);
+      fs.mkdirSync(path.dirname(fpath), { recursive: true });
+      await fs.promises.appendFile(fpath, lines.join(""), "utf8");
+    }
   } catch (err) {
     console.error("diskLog error:", err?.message);
   } finally {
@@ -73,32 +148,54 @@ async function flushQueue() {
   }
 }
 
+// ====== SYNC A DRIVE (cada X segundos si cambió el archivo de hoy) ======
+const lastUploadedHash = new Map(); // key -> md5
+let syncing = false;
+
+async function syncTodayToDrive() {
+  if (!drive || syncing) return;
+  const key = todayKey();
+  const name = `waba-events-${key}.jsonl`;
+  const local = localPathFor(key);
+  if (!fs.existsSync(local)) return;
+
+  // Evitar subir si no hubo cambios
+  const hash = await md5File(local).catch(() => null);
+  if (!hash || lastUploadedHash.get(key) === hash) return;
+
+  syncing = true;
+  try {
+    let fileId = await driveFindFileIdByName(name);
+    fileId = await driveCreateOrUpdate(name, local, fileId);
+    lastUploadedHash.set(key, hash);
+    log("Sync a Drive OK:", name, fileId);
+  } catch (e) {
+    console.error("Sync Drive error:", e?.message);
+  } finally {
+    syncing = false;
+  }
+}
+
 process.on("SIGTERM", async () => {
+  // flush + última sync antes de salir
   await new Promise((r) => {
-    const interval = setInterval(() => {
-      if (!writing && writeQueue.length === 0) {
-        clearInterval(interval);
-        r();
-      }
+    const iv = setInterval(() => {
+      if (!writing && writeQueue.length === 0) { clearInterval(iv); r(); }
     }, 20);
   });
+  await syncTodayToDrive().catch(() => {});
   process.exit(0);
 });
 
-// ====== WhatsApp API helpers ======
+// ====== WhatsApp API helpers (sin cambios sustanciales) ======
 async function sendMessage(to, payload) {
   const url = `https://graph.facebook.com/v20.0/${WABA_PHONE_ID}/messages`;
   const body = { messaging_product: "whatsapp", to, ...payload };
-
   const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-
   const json = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     log("ERROR enviando mensaje", resp.status, json);
@@ -130,141 +227,103 @@ async function sendQuickReplyVentas(to) {
 }
 
 async function sendDerivacion(to) {
-  // Enviar tarjeta de contacto + texto con wa.me
   await sendMessage(to, {
     type: "contacts",
-    contacts: [
-      {
-        name: { formatted_name: "NIMAT Ventas" },
-        phones: [{ phone: VENTAS_NUMBER_E164, type: "CELL", wa_id: VENTAS_NUMBER_PLAIN }],
-      },
-    ],
+    contacts: [{ name: { formatted_name: "NIMAT Ventas" },
+      phones: [{ phone: VENTAS_NUMBER_E164, type: "CELL", wa_id: VENTAS_NUMBER_PLAIN }] }],
   });
-
   const texto = [
     "Te derivo con nuestro equipo de Ventas:",
     `➡️ wa.me/${VENTAS_NUMBER_PLAIN}`,
-    `También podés agendar este contacto: ${VENTAS_NUMBER_E164}`,
+    `También podés agendar este contacto: ${VENTAS_NUMBER_E164}`
   ].join("\n");
-
   await sendText(to, texto);
   diskLog("action", { action: "derivacion_enviada", to });
 }
 
-// ====== Seguridad: verificación de firma (opcional pero recomendado) ======
+// ====== Seguridad (opcional) ======
 function verifySignature(req) {
-  if (!APP_SECRET) return true; // deshabilitado si no hay APP_SECRET
-  const signature = req.get("x-hub-signature-256") || "";
-  const expected =
-    "sha256=" + crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
-
-  // timing safe compare
-  const buffA = Buffer.from(signature);
-  const buffB = Buffer.from(expected);
-  if (buffA.length !== buffB.length) return false;
-  return crypto.timingSafeEqual(buffA, buffB);
+  if (!APP_SECRET) return true;
+  const sig = req.get("x-hub-signature-256") || "";
+  const expected = "sha256=" + crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
+  const a = Buffer.from(sig), b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
-// ====== WEBHOOK (VERIFY) ======
+// ====== WEBHOOKS ======
 app.get("/whatsapp/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    log("Webhook verificado correctamente");
-    return res.status(200).send(challenge);
-  }
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// ====== WEBHOOK (RECEIVE) ======
 app.post("/whatsapp/webhook", async (req, res) => {
   try {
     if (!verifySignature(req)) {
-      log("Firma inválida X-Hub-Signature-256");
       diskLog("error", { where: "verifySignature", message: "invalid_signature" });
       return res.sendStatus(401);
     }
-
     const { object, entry } = req.body || {};
-    if (object !== "whatsapp_business_account" || !Array.isArray(entry)) {
-      return res.sendStatus(200);
-    }
+    if (object !== "whatsapp_business_account" || !Array.isArray(entry)) return res.sendStatus(200);
 
     for (const ent of entry) {
       for (const change of ent.changes || []) {
         const val = change.value || {};
 
-        // 1) ESTADOS DE MENSAJES
+        // Estados
         if (Array.isArray(val.statuses)) {
           for (const st of val.statuses) {
             const info = {
-              status: st.status,           // sent, delivered, read, failed
-              message_id: st.id,
-              recipient_id: st.recipient_id,
-              timestamp: st.timestamp,
-              conversation: st.conversation,
-              pricing: st.pricing,
-              errors: st.errors,
+              status: st.status, message_id: st.id, recipient_id: st.recipient_id,
+              timestamp: st.timestamp, conversation: st.conversation, pricing: st.pricing, errors: st.errors
             };
             log("STATUS:", info.status, info.message_id);
             diskLog("status", info);
           }
         }
 
-        // 2) MENSAJES ENTRANTES
+        // Mensajes entrantes
         if (Array.isArray(val.messages)) {
           for (const msg of val.messages) {
             const from = msg.from;
             const type = msg.type;
             const textLower = msg.text?.body?.toLowerCase?.() || "";
-
             log("INCOMING:", { from, type, msgId: msg.id });
             diskLog("message", {
-              from,
-              type,
-              msg_id: msg.id,
-              text: msg.text?.body || null,
-              button: msg.button || null,
-              interactive: msg.interactive || null,
-              image: msg.image || null,
-              document: msg.document || null,
-              timestamp: msg.timestamp,
+              from, type, msg_id: msg.id, text: msg.text?.body || null,
+              button: msg.button || null, interactive: msg.interactive || null,
+              image: msg.image || null, document: msg.document || null, timestamp: msg.timestamp,
             });
 
-            // Si apretó botón quick-reply
             if (type === "button" && msg.button?.payload) {
-              const payload = msg.button.payload;
-              if (payload === "CONTACTAR_VENTAS" || payload === "ATENCION_HUMANA") {
-                await sendDerivacion(from);
-                continue;
-              }
+              const p = msg.button.payload;
+              if (p === "CONTACTAR_VENTAS" || p === "ATENCION_HUMANA") { await sendDerivacion(from); continue; }
             }
-
-            // Palabras clave para derivar
-            if (["ventas", "hablar con ventas", "humano", "asesor", "baja", "derivar"].some(k => textLower.includes(k))) {
-              await sendDerivacion(from);
-              continue;
+            if (["ventas","hablar con ventas","humano","asesor","baja","derivar"].some(k => textLower.includes(k))) {
+              await sendDerivacion(from); continue;
             }
-
-            // Respuesta por defecto: ofrecer botón
             await sendQuickReplyVentas(from);
           }
         }
       }
     }
-
-    // ACK rápido
     return res.sendStatus(200);
   } catch (err) {
     log("ERROR webhook:", err?.message);
     diskLog("error", { where: "webhook", message: err?.message });
-    // Nunca devolver 500 a Meta; 200 evita reintentos agresivos
     return res.sendStatus(200);
   }
 });
 
 app.get("/health", (_req, res) => res.send("ok"));
 
-app.listen(PORT, () => log(`Servidor escuchando en :${PORT} — log en ${LOG_FILE_PATH}`));
+// ====== STARTUP ======
+(async () => {
+  await initDrive();
+  await seedTodayFromDrive().catch(e => console.warn("Seed fallida:", e?.message));
+  if (DRIVE_SYNC_ENABLED) setInterval(syncTodayToDrive, DRIVE_SYNC_INTERVAL_MS);
+  app.listen(PORT, () => log(`Servidor escuchando en :${PORT} — logs en ${LOG_LOCAL_DIR}`));
+})();
