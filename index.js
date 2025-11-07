@@ -234,8 +234,7 @@ async function sendQuickReplyVentas(to) {
       footer: { text: footerText },
       action: {
         buttons: [
-          { type: "reply", reply: { id: "CONTACTAR_VENTAS", title: "Hablar con Ventas" } },
-          { type: "reply", reply: { id: "ATENCION_HUMANA", title: "Atención humana" } },
+          { type: "reply", reply: { id: "CONTACTAR_VENTAS", title: "Hablar con Ventas" } }
         ],
       },
     },
