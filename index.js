@@ -8,6 +8,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
 import { google } from "googleapis";
+import { title } from "process";
 
 dotenv.config();
 
@@ -25,7 +26,7 @@ const WABA_PHONE_ID = process.env.WABA_PHONE_ID;
 const APP_SECRET = process.env.APP_SECRET || null;
 
 // Derivación a Ventas
-const VENTAS_NUMBER_E164 = process.env.VENTAS_NUMBER_E164 || "+54911XXXXXXX";
+const VENTAS_NUMBER_E164 = process.env.VENTAS_NUMBER_E164;
 const VENTAS_NUMBER_PLAIN = VENTAS_NUMBER_E164.replace(/\+/g, "");
 
 // Log local + Sync a Drive
@@ -220,11 +221,18 @@ async function sendMessage(to, payload) {
 async function sendText(to, text) { return sendMessage(to, { type: "text", text: { body: text } }); }
 
 async function sendQuickReplyVentas(to) {
+   const bodyText = [
+    "🙏 ¡Gracias por tu mensaje!",
+    "Este número no es atendido. Para consultas y pedidos, contactá a nuestro equipo de Ventas."
+  ].join("\n");
+  const footerText = "El equipo de NIMAT";
   return sendMessage(to, {
     type: "interactive",
     interactive: {
       type: "button",
-      body: { text: "¿Querés hablar con Ventas?" },
+      title: {text: "Aviso"},
+      body: { text: bodyText },
+      footer: { text: footerText },
       action: {
         buttons: [
           { type: "reply", reply: { id: "CONTACTAR_VENTAS", title: "Hablar con Ventas" } },
@@ -307,13 +315,23 @@ app.post("/whatsapp/webhook", async (req, res) => {
               image: msg.image || null, document: msg.document || null, timestamp: msg.timestamp,
             });
 
+            if (type === "interactive") {
+              const btnId = msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id;
+              if (["CONTACTAR_VENTAS","ATENCION_HUMANA"].includes(btnId)) {
+                await sendDerivacion(from);
+                continue;
+              }
+            }
             if (type === "button" && msg.button?.payload) {
               const p = msg.button.payload;
               if (p === "CONTACTAR_VENTAS" || p === "ATENCION_HUMANA") { await sendDerivacion(from); continue; }
             }
+
             if (["ventas","hablar con ventas","humano","asesor","baja","derivar"].some(k => textLower.includes(k))) {
-              await sendDerivacion(from); continue;
+              await sendDerivacion(from);
+              continue;
             }
+            
             await sendQuickReplyVentas(from);
           }
         }
