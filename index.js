@@ -230,7 +230,6 @@ async function sendQuickReplyVentas(to) {
     type: "interactive",
     interactive: {
       type: "button",
-      title: {text: "Aviso"},
       body: { text: bodyText },
       footer: { text: footerText },
       action: {
