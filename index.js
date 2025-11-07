@@ -246,8 +246,15 @@ async function sendDerivacion(to) {
   await sendMessage(to, {
     type: "contacts",
     contacts: [{
-      name: { formatted_name: "NIMAT Ventas" },
-      phones: [{ phone: VENTAS_NUMBER_E164, type: "CELL", wa_id: VENTAS_NUMBER_PLAIN }]
+      name: { 
+        formatted_name: "NIMAT - Veronica Severo",
+        first_name: 'Verónica',
+        last_name: 'Severo',
+        middle_name: '',
+        suffix: '',
+        prefix: '' 
+       },
+      phones: [{ phone: VENTAS_NUMBER_E164, type: "WORK", wa_id: VENTAS_NUMBER_PLAIN }]
     }],
   });
   const texto = [
