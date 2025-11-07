@@ -34,20 +34,48 @@ const DRIVE_SYNC_INTERVAL_MS = Number(process.env.DRIVE_SYNC_INTERVAL_MS || 1500
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
 // ====== GOOGLE DRIVE CLIENT ======
+
 let drive = null;
+
 async function initDrive() {
-  if (!DRIVE_SYNC_ENABLED) return;
+  if (String(process.env.DRIVE_SYNC_ENABLED || "true") !== "true") return;
+
   const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
   let privateKey = process.env.GOOGLE_PRIVATE_KEY;
-  if (!clientEmail || !privateKey || !GOOGLE_DRIVE_FOLDER_ID) {
-    console.warn("Drive sync deshabilitado: faltan creds o folder id");
+  const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+
+  if (!clientEmail || !privateKey || !folderId) {
+    console.warn("Drive sync deshabilitado: faltan GOOGLE_CLIENT_EMAIL / GOOGLE_PRIVATE_KEY / GOOGLE_DRIVE_FOLDER_ID");
     return;
   }
+
+  // reparar saltos de línea
   privateKey = privateKey.replace(/\\n/g, "\n");
-  const auth = new google.auth.JWT(clientEmail, null, privateKey, [
-    "https://www.googleapis.com/auth/drive.file"
-  ]);
+
+  // 1) JWT con scope (primero 'drive' para validar; luego podés bajar a 'drive.file')
+  const auth = new google.auth.JWT({
+    email: clientEmail,
+    key: privateKey,
+    scopes: ["https://www.googleapis.com/auth/drive"], // probar amplio; luego podés usar drive.file
+  });
+
+  // 2) FORZAR la autorización aquí (evita el "unregistered callers")
+  await auth.authorize();
+
+  // 3) Cliente Drive
   drive = google.drive({ version: "v3", auth });
+
+  // 4) Sanity check opcional: ¿veo la carpeta?
+  try {
+    await drive.files.get({
+      fileId: folderId,
+      fields: "id, name",
+      supportsAllDrives: true
+    });
+    console.log("Drive auth OK y acceso a carpeta OK:", folderId);
+  } catch (e) {
+    console.error("No puedo acceder a la carpeta. ¿La compartiste con la Service Account como Editor?", e?.message);
+  }
 }
 
 function rawBodySaver(req, res, buf) { req.rawBody = buf; }
