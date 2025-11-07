@@ -1,5 +1,6 @@
 // index.js
-// WhatsApp Business Platform — Webhook con log (JSONL) y sync a Google Drive sin disk de Render
+// WhatsApp Business Platform — Webhook con log (JSONL) y sync a Google Drive usando OAuth (usuario humano)
+
 import express from "express";
 import dotenv from "dotenv";
 import fs from "fs";
@@ -27,54 +28,38 @@ const APP_SECRET = process.env.APP_SECRET || null;
 const VENTAS_NUMBER_E164 = process.env.VENTAS_NUMBER_E164 || "+54911XXXXXXX";
 const VENTAS_NUMBER_PLAIN = VENTAS_NUMBER_E164.replace(/\+/g, "");
 
-// Log local (efímero) + Sync a Drive
+// Log local + Sync a Drive
 const LOG_LOCAL_DIR = process.env.LOG_LOCAL_DIR || "/tmp/nimat-logs";
 const DRIVE_SYNC_ENABLED = String(process.env.DRIVE_SYNC_ENABLED || "true") === "true";
 const DRIVE_SYNC_INTERVAL_MS = Number(process.env.DRIVE_SYNC_INTERVAL_MS || 15000);
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
-// ====== GOOGLE DRIVE CLIENT ======
-
+// ====== GOOGLE DRIVE (OAuth con usuario) ======
 let drive = null;
 
-async function initDrive() {
-  if (String(process.env.DRIVE_SYNC_ENABLED || "true") !== "true") return;
-
-  const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
-  let privateKey = process.env.GOOGLE_PRIVATE_KEY;
-  const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-
-  if (!clientEmail || !privateKey || !folderId) {
-    console.warn("Drive sync deshabilitado: faltan GOOGLE_CLIENT_EMAIL / GOOGLE_PRIVATE_KEY / GOOGLE_DRIVE_FOLDER_ID");
+async function initDriveOAuth() {
+  if (!DRIVE_SYNC_ENABLED) return;
+  const cid = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const sec = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const rft = process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
+  if (!cid || !sec || !rft || !GOOGLE_DRIVE_FOLDER_ID) {
+    console.warn("Drive OAuth deshabilitado: faltan CLIENT_ID / CLIENT_SECRET / REFRESH_TOKEN / FOLDER_ID");
     return;
   }
 
-  // reparar saltos de línea
-  privateKey = privateKey.replace(/\\n/g, "\n");
+  // OAuth2 con refresh token (no necesitamos redirect aquí)
+  const oauth2 = new google.auth.OAuth2(cid, sec, "http://localhost");
+  oauth2.setCredentials({ refresh_token: rft });
 
-  // 1) JWT con scope (primero 'drive' para validar; luego podés bajar a 'drive.file')
-  const auth = new google.auth.JWT({
-    email: clientEmail,
-    key: privateKey,
-    scopes: ["https://www.googleapis.com/auth/drive"], // probar amplio; luego podés usar drive.file
-  });
+  // Cliente de Drive
+  drive = google.drive({ version: "v3", auth: oauth2 });
 
-  // 2) FORZAR la autorización aquí (evita el "unregistered callers")
-  await auth.authorize();
-
-  // 3) Cliente Drive
-  drive = google.drive({ version: "v3", auth });
-
-  // 4) Sanity check opcional: ¿veo la carpeta?
+  // Sanity: acceso a la carpeta (Mi unidad)
   try {
-    await drive.files.get({
-      fileId: folderId,
-      fields: "id, name",
-      supportsAllDrives: true
-    });
-    console.log("Drive auth OK y acceso a carpeta OK:", folderId);
+    await drive.files.get({ fileId: GOOGLE_DRIVE_FOLDER_ID, fields: "id, name" });
+    console.log("Drive OAuth OK. Carpeta accesible:", GOOGLE_DRIVE_FOLDER_ID);
   } catch (e) {
-    console.error("No puedo acceder a la carpeta. ¿La compartiste con la Service Account como Editor?", e?.message);
+    console.error("No accedo a la carpeta de Drive. ¿Folder ID correcto y usuario con acceso?", e?.message);
   }
 }
 
@@ -104,7 +89,7 @@ async function md5File(filePath) {
 async function driveFindFileIdByName(name) {
   if (!drive) return null;
   const q = `'${GOOGLE_DRIVE_FOLDER_ID}' in parents and name='${name}' and trashed=false`;
-  const { data } = await drive.files.list({ q, fields: "files(id,name)", spaces: "drive" });
+  const { data } = await drive.files.list({ q, fields: "files(id,name)" });
   return data.files?.[0]?.id || null;
 }
 
@@ -133,7 +118,8 @@ async function seedTodayFromDrive() {
   const key = todayKey();
   const name = `waba-events-${key}.jsonl`;
   const local = localPathFor(key);
-  if (fs.existsSync(local)) return; // ya existe
+  if (fs.existsSync(local)) return; // ya existe local
+
   const fid = await driveFindFileIdByName(name);
   if (fid) {
     fs.mkdirSync(path.dirname(local), { recursive: true });
@@ -142,7 +128,7 @@ async function seedTodayFromDrive() {
   }
 }
 
-// ====== QUEUE DE LOG (escritura local en /tmp) ======
+// ====== QUEUE DE LOG (escritura local) ======
 const writeQueue = [];
 let writing = false;
 
@@ -156,7 +142,6 @@ async function flushQueue() {
   if (writing || writeQueue.length === 0) return;
   writing = true;
   try {
-    // Agrupar por key (día)
     const groups = new Map();
     for (const item of writeQueue.splice(0, writeQueue.length)) {
       const arr = groups.get(item.key) || [];
@@ -176,7 +161,7 @@ async function flushQueue() {
   }
 }
 
-// ====== SYNC A DRIVE (cada X segundos si cambió el archivo de hoy) ======
+// ====== SYNC A DRIVE (si cambió el archivo de hoy) ======
 const lastUploadedHash = new Map(); // key -> md5
 let syncing = false;
 
@@ -187,7 +172,6 @@ async function syncTodayToDrive() {
   const local = localPathFor(key);
   if (!fs.existsSync(local)) return;
 
-  // Evitar subir si no hubo cambios
   const hash = await md5File(local).catch(() => null);
   if (!hash || lastUploadedHash.get(key) === hash) return;
 
@@ -198,14 +182,13 @@ async function syncTodayToDrive() {
     lastUploadedHash.set(key, hash);
     log("Sync a Drive OK:", name, fileId);
   } catch (e) {
-    console.error("Sync Drive error:", e?.message);
+    console.error("Sync Drive error:", e?.response?.data || e?.message);
   } finally {
     syncing = false;
   }
 }
 
 process.on("SIGTERM", async () => {
-  // flush + última sync antes de salir
   await new Promise((r) => {
     const iv = setInterval(() => {
       if (!writing && writeQueue.length === 0) { clearInterval(iv); r(); }
@@ -215,7 +198,7 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-// ====== WhatsApp API helpers (sin cambios sustanciales) ======
+// ====== WhatsApp API helpers ======
 async function sendMessage(to, payload) {
   const url = `https://graph.facebook.com/v20.0/${WABA_PHONE_ID}/messages`;
   const body = { messaging_product: "whatsapp", to, ...payload };
@@ -234,9 +217,7 @@ async function sendMessage(to, payload) {
   return json;
 }
 
-async function sendText(to, text) {
-  return sendMessage(to, { type: "text", text: { body: text } });
-}
+async function sendText(to, text) { return sendMessage(to, { type: "text", text: { body: text } }); }
 
 async function sendQuickReplyVentas(to) {
   return sendMessage(to, {
@@ -257,8 +238,10 @@ async function sendQuickReplyVentas(to) {
 async function sendDerivacion(to) {
   await sendMessage(to, {
     type: "contacts",
-    contacts: [{ name: { formatted_name: "NIMAT Ventas" },
-      phones: [{ phone: VENTAS_NUMBER_E164, type: "CELL", wa_id: VENTAS_NUMBER_PLAIN }] }],
+    contacts: [{
+      name: { formatted_name: "NIMAT Ventas" },
+      phones: [{ phone: VENTAS_NUMBER_E164, type: "CELL", wa_id: VENTAS_NUMBER_PLAIN }]
+    }],
   });
   const texto = [
     "Te derivo con nuestro equipo de Ventas:",
@@ -269,7 +252,7 @@ async function sendDerivacion(to) {
   diskLog("action", { action: "derivacion_enviada", to });
 }
 
-// ====== Seguridad (opcional) ======
+// ====== Seguridad (firma de Meta opcional) ======
 function verifySignature(req) {
   if (!APP_SECRET) return true;
   const sig = req.get("x-hub-signature-256") || "";
@@ -301,7 +284,6 @@ app.post("/whatsapp/webhook", async (req, res) => {
       for (const change of ent.changes || []) {
         const val = change.value || {};
 
-        // Estados
         if (Array.isArray(val.statuses)) {
           for (const st of val.statuses) {
             const info = {
@@ -313,7 +295,6 @@ app.post("/whatsapp/webhook", async (req, res) => {
           }
         }
 
-        // Mensajes entrantes
         if (Array.isArray(val.messages)) {
           for (const msg of val.messages) {
             const from = msg.from;
@@ -350,7 +331,7 @@ app.get("/health", (_req, res) => res.send("ok"));
 
 // ====== STARTUP ======
 (async () => {
-  await initDrive();
+  await initDriveOAuth();
   await seedTodayFromDrive().catch(e => console.warn("Seed fallida:", e?.message));
   if (DRIVE_SYNC_ENABLED) setInterval(syncTodayToDrive, DRIVE_SYNC_INTERVAL_MS);
   app.listen(PORT, () => log(`Servidor escuchando en :${PORT} — logs en ${LOG_LOCAL_DIR}`));

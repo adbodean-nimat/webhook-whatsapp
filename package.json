@@ -4,12 +4,15 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_ENV=development node index.js"
+    "dev": "NODE_ENV=development node index.js",
+    "oauth:token": "node oauth/get_oauth_token.js",
+    "sanity:drive": "node sanity-drive.js"
   },
   "dependencies": {
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
-    "googleapis": "^164.1.0"
+    "googleapis": "^164.1.0",
+    "open": "^9.1.0"
   }
 }
 
