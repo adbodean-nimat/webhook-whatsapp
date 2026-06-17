@@ -25,9 +25,11 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const WABA_PHONE_ID = process.env.WABA_PHONE_ID;
 const APP_SECRET = process.env.APP_SECRET || null;
 
-// Derivación a Ventas
+// Derivación a Ventas / Cuentas Corrientes
 const VENTAS_NUMBER_E164 = process.env.VENTAS_NUMBER_E164;
 const VENTAS_NUMBER_PLAIN = VENTAS_NUMBER_E164.replace(/\+/g, "");
+const HILDA_NUMBER_E164 = process.env.HILDA_NUMBER_E164;
+const HILDA_NUMBER_PLAIN = HILDA_NUMBER_E164.replace(/\+/g, "");
 
 // Log local + Sync a Drive
 const LOG_LOCAL_DIR = process.env.LOG_LOCAL_DIR || "/tmp/nimat-logs";
@@ -220,10 +222,10 @@ async function sendMessage(to, payload) {
 
 async function sendText(to, text) { return sendMessage(to, { type: "text", text: { body: text } }); }
 
-async function sendQuickReplyVentas(to) {
+async function sendQuickReplyContactos(to) {
    const bodyText = [
     "🙏 ¡Gracias por tu mensaje!",
-    "Este número no es atendido. Para consultas y pedidos, contactá a nuestro equipo de Ventas."
+    "Este número no es atendido. Para consultas, pedidos o cuentas corrientes, elegí una opción."
   ].join("\n");
   const footerText = "El equipo de NIMAT";
   return sendMessage(to, {
@@ -234,7 +236,8 @@ async function sendQuickReplyVentas(to) {
       footer: { text: footerText },
       action: {
         buttons: [
-          { type: "reply", reply: { id: "CONTACTAR_VENTAS", title: "Hablar con Ventas" } }
+          { type: "reply", reply: { id: "CONTACTAR_VENTAS", title: "Hablar con Ventas" } },
+          { type: "reply", reply: { id: "CONTACTAR_HILDA", title: "Hablar con Hilda" } }
         ],
       },
     },
@@ -263,6 +266,30 @@ async function sendDerivacion(to) {
   ].join("\n");
   await sendText(to, texto);
   diskLog("action", { action: "derivacion_enviada", to });
+}
+
+async function sendDerivacionHilda(to) {
+  await sendMessage(to, {
+    type: "contacts",
+    contacts: [{
+      name: {
+        formatted_name: "NIMAT - Hilda Yelin",
+        first_name: "Hilda",
+        last_name: "Yelin",
+        middle_name: "",
+        suffix: "",
+        prefix: ""
+      },
+      phones: [{ phone: HILDA_NUMBER_E164, type: "WORK", wa_id: HILDA_NUMBER_PLAIN }]
+    }],
+  });
+  const texto = [
+    "Te derivo con Hilda, de Cuentas Corrientes:",
+    `➡️ wa.me/${HILDA_NUMBER_PLAIN}`,
+    `También podés agendar este contacto: ${HILDA_NUMBER_E164}`
+  ].join("\n");
+  await sendText(to, texto);
+  diskLog("action", { action: "derivacion_hilda_enviada", to });
 }
 
 // ====== Seguridad (firma de Meta opcional) ======
@@ -326,10 +353,20 @@ app.post("/whatsapp/webhook", async (req, res) => {
                 await sendDerivacion(from);
                 continue;
               }
+              if (btnId === "CONTACTAR_HILDA") {
+                await sendDerivacionHilda(from);
+                continue;
+              }
             }
             if (type === "button" && msg.button?.payload) {
               const p = msg.button.payload;
               if (p === "CONTACTAR_VENTAS" || p === "ATENCION_HUMANA") { await sendDerivacion(from); continue; }
+              if (p === "CONTACTAR_HILDA") { await sendDerivacionHilda(from); continue; }
+            }
+
+            if (["hilda","cuentas corrientes","cuenta corriente","deuda","deuda vencida","aviso de deuda"].some(k => textLower.includes(k))) {
+              await sendDerivacionHilda(from);
+              continue;
             }
 
             if (["ventas","hablar con ventas","humano","asesor","baja","derivar"].some(k => textLower.includes(k))) {
@@ -337,7 +374,7 @@ app.post("/whatsapp/webhook", async (req, res) => {
               continue;
             }
             
-            await sendQuickReplyVentas(from);
+            await sendQuickReplyContactos(from);
           }
         }
       }
