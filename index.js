@@ -8,7 +8,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
 import { google } from "googleapis";
-import { title } from "process";
+import { createStatusOutbox } from "./wep-status.js";
+import { verifyMetaSignature } from "./meta-signature.js";
+import { resolveWepConfig } from "./wep-config.js";
 
 dotenv.config();
 
@@ -24,6 +26,8 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const WABA_PHONE_ID = process.env.WABA_PHONE_ID;
 const APP_SECRET = process.env.APP_SECRET || null;
+const allowUnsignedLocal = ["development", "test"].includes(process.env.NODE_ENV) && process.env.ALLOW_UNSIGNED_WEBHOOKS === "true";
+if (!APP_SECRET && !allowUnsignedLocal) throw new Error("APP_SECRET es obligatorio; solo desarrollo/pruebas pueden usar ALLOW_UNSIGNED_WEBHOOKS=true");
 
 // Derivación a Ventas / Cuentas Corrientes
 const VENTAS_NUMBER_E164 = process.env.VENTAS_NUMBER_E164;
@@ -36,6 +40,9 @@ const LOG_LOCAL_DIR = process.env.LOG_LOCAL_DIR || "/tmp/nimat-logs";
 const DRIVE_SYNC_ENABLED = String(process.env.DRIVE_SYNC_ENABLED || "true") === "true";
 const DRIVE_SYNC_INTERVAL_MS = Number(process.env.DRIVE_SYNC_INTERVAL_MS || 15000);
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const wepConfig = resolveWepConfig(process.env, LOG_LOCAL_DIR);
+const statusOutbox = createStatusOutbox({ dir: LOG_LOCAL_DIR, url: wepConfig.url, token: wepConfig.token });
+if (!wepConfig.enabled) console.warn("WEP_HABILITAR=false: los estados se registran en JSONL, pero WEP no recibe estados");
 
 // ====== GOOGLE DRIVE (OAuth con usuario) ======
 let drive = null;
@@ -292,14 +299,10 @@ async function sendDerivacionHilda(to) {
   diskLog("action", { action: "derivacion_hilda_enviada", to });
 }
 
-// ====== Seguridad (firma de Meta opcional) ======
+// ====== Seguridad (firma de Meta obligatoria en producción) ======
 function verifySignature(req) {
   if (!APP_SECRET) return true;
-  const sig = req.get("x-hub-signature-256") || "";
-  const expected = "sha256=" + crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
-  const a = Buffer.from(sig), b = Buffer.from(expected);
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  return verifyMetaSignature(req.rawBody, req.get("x-hub-signature-256"), APP_SECRET);
 }
 
 // ====== WEBHOOKS ======
@@ -320,20 +323,30 @@ app.post("/whatsapp/webhook", async (req, res) => {
     const { object, entry } = req.body || {};
     if (object !== "whatsapp_business_account" || !Array.isArray(entry)) return res.sendStatus(200);
 
+    // Persist every status before any automatic reply. A disk failure may trigger
+    // a Meta retry, so no incoming message may have been acted on yet.
     for (const ent of entry) {
       for (const change of ent.changes || []) {
         const val = change.value || {};
-
-        if (Array.isArray(val.statuses)) {
-          for (const st of val.statuses) {
-            const info = {
-              status: st.status, message_id: st.id, recipient_id: st.recipient_id,
-              timestamp: st.timestamp, conversation: st.conversation, pricing: st.pricing, errors: st.errors
-            };
-            log("STATUS:", info.status, info.message_id);
-            diskLog("status", info);
+        if (!Array.isArray(val.statuses)) continue;
+        for (const st of val.statuses) {
+          const info = {
+            status: st.status, message_id: st.id, recipient_id: st.recipient_id,
+            timestamp: st.timestamp, conversation: st.conversation, pricing: st.pricing, errors: st.errors
+          };
+          log("STATUS:", info.status, info.message_id);
+          try { statusOutbox.enqueue(st, info); }
+          catch (e) {
+            console.error("No se pudo persistir el estado antes de responder a Meta:", e?.message);
+            return res.sendStatus(503);
           }
         }
+      }
+    }
+
+    for (const ent of entry) {
+      for (const change of ent.changes || []) {
+        const val = change.value || {};
 
         if (Array.isArray(val.messages)) {
           for (const msg of val.messages) {
@@ -393,6 +406,8 @@ app.get("/health", (_req, res) => res.send("ok"));
 (async () => {
   await initDriveOAuth();
   await seedTodayFromDrive().catch(e => console.warn("Seed fallida:", e?.message));
+  statusOutbox.load();
+  statusOutbox.start();
   if (DRIVE_SYNC_ENABLED) setInterval(syncTodayToDrive, DRIVE_SYNC_INTERVAL_MS);
   app.listen(PORT, () => log(`Servidor escuchando en :${PORT} — logs en ${LOG_LOCAL_DIR}`));
 })();

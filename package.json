@@ -6,7 +6,9 @@
     "start": "node index.js",
     "dev": "NODE_ENV=development node index.js",
     "oauth:token": "node oauth/get_oauth_token.js",
-    "sanity:drive": "node sanity-drive.js"
+    "sanity:drive": "node sanity-drive.js",
+    "replay:statuses": "node replay-statuses.js",
+    "test": "node --test"
   },
   "dependencies": {
     "dotenv": "^17.2.3",
@@ -15,4 +17,3 @@
     "open": "^9.1.0"
   }
 }
-
